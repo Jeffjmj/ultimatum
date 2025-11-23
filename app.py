@@ -5,28 +5,24 @@ import random
 import time
 
 app = Flask(__name__)
-# Enable CORS so your React frontend can talk to this Flask backend
 CORS(app) 
 
-# --- In-Memory Database (Replaced by SQLite/Postgres in production) ---
-# For a simple experiment hosted on Railway, in-memory works 
-# as long as the server doesn't restart during the session.
+# --- Global Storage (In-Memory) ---
 STATE = {
-    "status": "LOBBY", # LOBBY, TREATMENT_1, TREATMENT_2, FINISHED
+    "status": "LOBBY",
     "round": 0,
     "sub_round": 1,
     "treatment": 1,
-    "pairings": {} # { "pair_0": {"p1": "uid1", "p2": "uid2"} }
+    "pairings": {}
 }
 
-PLAYERS = {} # { "uid": {"name": "Alice", "role": "PARTICIPANT", "earnings": 0} }
-GAMES = {}   # { "game_id": { "proposer": "...", "responder": "...", "offer": 10, "status": "..." } }
+PLAYERS = {} 
+GAMES = {}   
 
 ENDOWMENT = 10
 
 # --- Helper Functions ---
 def get_role_info(uid, sub_round):
-    # Find pair
     my_pair = None
     for pid, pair in STATE["pairings"].items():
         if pair["p1"] == uid or pair["p2"] == uid:
@@ -37,7 +33,6 @@ def get_role_info(uid, sub_round):
         return {"role": "SPECTATOR", "partner_name": None, "partner_id": None}
     
     is_p1 = (uid == my_pair["p1"])
-    # Logic: P1 is proposer for rounds 1-2, P2 for 3-4
     is_proposer = (sub_round <= 2 and is_p1) or (sub_round > 2 and not is_p1)
     
     partner_id = my_pair["p2"] if is_p1 else my_pair["p1"]
@@ -49,11 +44,11 @@ def get_role_info(uid, sub_round):
         "partner_name": partner_name
     }
 
-# --- Routes ---
+# --- Standard Routes ---
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "running", "msg": "Ultimatum Game API Active"})
+    return jsonify({"status": "running"})
 
 @app.route('/register', methods=['POST'])
 def register():
@@ -62,8 +57,7 @@ def register():
     name = data.get('name')
     is_researcher = data.get('isResearcher', False)
     
-    if not uid:
-        return jsonify({"error": "No UID provided"}), 400
+    if not uid: return jsonify({"error": "No UID"}), 400
         
     PLAYERS[uid] = {
         "uid": uid,
@@ -76,21 +70,14 @@ def register():
 
 @app.route('/state', methods=['GET'])
 def get_state():
-    # Polling endpoint: Returns global state + player specific context
     uid = request.args.get('uid')
-    
-    if not uid or uid not in PLAYERS:
-        return jsonify({"error": "Player not found"}), 404
+    if not uid or uid not in PLAYERS: return jsonify({"error": "Player not found"}), 404
 
-    # Get my specific game if active
-    my_game_data = None
-    
-    # Identify the current game ID for this user
     role_info = get_role_info(uid, STATE["sub_round"])
     partner_id = role_info.get('partner_id')
+    my_game_data = None
     
     if partner_id:
-        # Deterministic Game ID based on sorted IDs to ensure both players look at same game
         p1 = uid if uid < partner_id else partner_id
         p2 = partner_id if uid < partner_id else uid
         game_id = f"{STATE['treatment']}_{STATE['sub_round']}_{p1}_{p2}"
@@ -98,7 +85,6 @@ def get_state():
         if game_id in GAMES:
             my_game_data = GAMES[game_id]
         else:
-            # Lazy creation of game state if not exists
             if role_info['role'] == 'PROPOSER':
                 GAMES[game_id] = {
                     "id": game_id,
@@ -118,30 +104,57 @@ def get_state():
         "all_players_count": len(PLAYERS)
     })
 
-# --- Researcher Controls ---
+# --- DATA MANAGEMENT ROUTES (NEW) ---
+
+@app.route('/export_data', methods=['GET'])
+def export_data():
+    """
+    Call this URL to download all data as a JSON object.
+    You can convert JSON to Excel using online tools.
+    """
+    return jsonify({
+        "all_players": PLAYERS,
+        "all_games": GAMES,
+        "final_state": STATE
+    })
+
+@app.route('/reset_server', methods=['POST'])
+def reset_server():
+    """
+    Call this to WIPE all data and start fresh.
+    """
+    global PLAYERS, GAMES, STATE
+    PLAYERS = {}
+    GAMES = {}
+    STATE = {
+        "status": "LOBBY",
+        "round": 0,
+        "sub_round": 1,
+        "treatment": 1,
+        "pairings": {}
+    }
+    return jsonify({"success": True, "message": "Server memory wiped successfully."})
+
+
+# --- Game Logic Routes ---
 
 @app.route('/admin/start_treatment', methods=['POST'])
 def start_treatment():
     data = request.json
     treatment = data.get('treatment')
+    ids = [p['uid'] for p in PLAYERS.values() if p['role'] != 'RESEARCHER']
+    random.shuffle(ids)
     
-    participant_ids = [p['uid'] for p in PLAYERS.values() if p['role'] != 'RESEARCHER']
-    random.shuffle(participant_ids)
-    
-    new_pairings = {}
-    for i in range(0, len(participant_ids), 2):
-        if i + 1 < len(participant_ids):
-            new_pairings[f"pair_{i//2}"] = {
-                "p1": participant_ids[i],
-                "p2": participant_ids[i+1]
-            }
+    pairs = {}
+    for i in range(0, len(ids), 2):
+        if i + 1 < len(ids):
+            pairs[f"pair_{i//2}"] = {"p1": ids[i], "p2": ids[i+1]}
             
     STATE["status"] = f"TREATMENT_{treatment}"
     STATE["treatment"] = treatment
     STATE["sub_round"] = 1
-    STATE["pairings"] = new_pairings
-    
-    return jsonify({"success": True, "state": STATE})
+    STATE["pairings"] = pairs
+    return jsonify({"success": True})
 
 @app.route('/admin/next_round', methods=['POST'])
 def next_round():
@@ -149,49 +162,39 @@ def next_round():
         STATE["sub_round"] += 1
     else:
         STATE["status"] = "WAITING_NEXT_PHASE"
-        
-    return jsonify({"success": True, "state": STATE})
-
-# --- Game Actions ---
+    return jsonify({"success": True})
 
 @app.route('/game/offer', methods=['POST'])
 def make_offer():
     data = request.json
-    game_id = data.get('game_id')
-    amount = data.get('amount')
-    
-    if game_id in GAMES:
-        GAMES[game_id]['offer'] = amount
-        GAMES[game_id]['status'] = 'OFFER_MADE'
+    gid = data.get('game_id')
+    if gid in GAMES:
+        GAMES[gid]['offer'] = data.get('amount')
+        GAMES[gid]['status'] = 'OFFER_MADE'
         return jsonify({"success": True})
-    return jsonify({"error": "Game not found"}), 404
+    return jsonify({"error": "No game"}), 404
 
 @app.route('/game/respond', methods=['POST'])
 def respond_offer():
     data = request.json
-    game_id = data.get('game_id')
+    gid = data.get('game_id')
     accepted = data.get('accepted')
     
-    if game_id in GAMES:
-        game = GAMES[game_id]
-        offer = game['offer']
+    if gid in GAMES:
+        g = GAMES[gid]
+        offer = g['offer']
+        p_earn = (ENDOWMENT - offer) if accepted else 0
+        r_earn = offer if accepted else 0
         
-        prop_earn = (ENDOWMENT - offer) if accepted else 0
-        resp_earn = offer if accepted else 0
+        g['response'] = 'ACCEPTED' if accepted else 'REJECTED'
+        g['status'] = 'COMPLETED'
+        g['earnings'] = {g['proposer']: p_earn, g['responder']: r_earn}
         
-        game['response'] = 'ACCEPTED' if accepted else 'REJECTED'
-        game['status'] = 'COMPLETED'
-        game['earnings'] = {
-            game['proposer']: prop_earn,
-            game['responder']: resp_earn
-        }
-        
-        # Update cumulative earnings
-        if game['proposer'] in PLAYERS: PLAYERS[game['proposer']]['earnings'] += prop_earn
-        if game['responder'] in PLAYERS: PLAYERS[game['responder']]['earnings'] += resp_earn
+        if g['proposer'] in PLAYERS: PLAYERS[g['proposer']]['earnings'] += p_earn
+        if g['responder'] in PLAYERS: PLAYERS[g['responder']]['earnings'] += r_earn
         
         return jsonify({"success": True})
-    return jsonify({"error": "Game not found"}), 404
+    return jsonify({"error": "No game"}), 404
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)

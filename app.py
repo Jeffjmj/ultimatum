@@ -5,11 +5,13 @@ import random
 import time
 
 app = Flask(__name__)
+# Enable CORS to allow the frontend to talk to this server
 CORS(app) 
 
 # --- Global Storage (In-Memory) ---
+# WARNING: restarting the server wipes this data!
 STATE = {
-    "status": "LOBBY",
+    "status": "LOBBY", # LOBBY, TREATMENT_1, TREATMENT_2, WAITING_NEXT_PHASE
     "round": 0,
     "sub_round": 1,
     "treatment": 1,
@@ -23,6 +25,7 @@ ENDOWMENT = 10
 
 # --- Helper Functions ---
 def get_role_info(uid, sub_round):
+    # Find the pair this user belongs to
     my_pair = None
     for pid, pair in STATE["pairings"].items():
         if pair["p1"] == uid or pair["p2"] == uid:
@@ -33,6 +36,7 @@ def get_role_info(uid, sub_round):
         return {"role": "SPECTATOR", "partner_name": None, "partner_id": None}
     
     is_p1 = (uid == my_pair["p1"])
+    # Logic: P1 is proposer for rounds 1-2, P2 is proposer for rounds 3-4
     is_proposer = (sub_round <= 2 and is_p1) or (sub_round > 2 and not is_p1)
     
     partner_id = my_pair["p2"] if is_p1 else my_pair["p1"]
@@ -48,36 +52,54 @@ def get_role_info(uid, sub_round):
 
 @app.route('/', methods=['GET'])
 def health_check():
-    return jsonify({"status": "running"})
+    return jsonify({"status": "running", "msg": "Ultimatum Game API Active"})
 
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json
     uid = data.get('uid')
     name = data.get('name')
-    is_researcher = data.get('isResearcher', False)
     
-    if not uid: return jsonify({"error": "No UID"}), 400
+    if not uid: return jsonify({"error": "No UID provided"}), 400
+
+    # If player already exists, just return them (allows re-login/refresh)
+    if uid in PLAYERS:
+        return jsonify({"success": True, "player": PLAYERS[uid]})
+
+    # --- AUTO-ASSIGNMENT LOGIC ---
+    # The first 3 people to join become Researchers.
+    # Everyone else becomes a Participant.
+    if len(PLAYERS) < 3:
+        role = "RESEARCHER"
+    else:
+        role = "PARTICIPANT"
         
     PLAYERS[uid] = {
         "uid": uid,
         "name": name,
-        "role": "RESEARCHER" if is_researcher else "PARTICIPANT",
+        "role": role,
         "earnings": 0,
         "joined_at": time.time()
     }
+    
+    print(f"Registered {name} as {role}. Total users: {len(PLAYERS)}")
     return jsonify({"success": True, "player": PLAYERS[uid]})
 
 @app.route('/state', methods=['GET'])
 def get_state():
+    """
+    Called by Participants to get their specific game state.
+    """
     uid = request.args.get('uid')
     if not uid or uid not in PLAYERS: return jsonify({"error": "Player not found"}), 404
 
+    # Get role info (Proposer vs Responder)
     role_info = get_role_info(uid, STATE["sub_round"])
     partner_id = role_info.get('partner_id')
     my_game_data = None
     
     if partner_id:
+        # Create a consistent ID for the game: "treatment_round_lowID_highID"
         p1 = uid if uid < partner_id else partner_id
         p2 = partner_id if uid < partner_id else uid
         game_id = f"{STATE['treatment']}_{STATE['sub_round']}_{p1}_{p2}"
@@ -85,6 +107,7 @@ def get_state():
         if game_id in GAMES:
             my_game_data = GAMES[game_id]
         else:
+            # Lazy creation: If I am the proposer and game doesn't exist, create it
             if role_info['role'] == 'PROPOSER':
                 GAMES[game_id] = {
                     "id": game_id,
@@ -104,13 +127,12 @@ def get_state():
         "all_players_count": len(PLAYERS)
     })
 
-# --- DATA MANAGEMENT ROUTES (NEW) ---
+# --- DATA MANAGEMENT ROUTES ---
 
 @app.route('/export_data', methods=['GET'])
 def export_data():
     """
-    Call this URL to download all data as a JSON object.
-    You can convert JSON to Excel using online tools.
+    Called by Researchers to download data and see the dashboard.
     """
     return jsonify({
         "all_players": PLAYERS,
@@ -121,7 +143,7 @@ def export_data():
 @app.route('/reset_server', methods=['POST'])
 def reset_server():
     """
-    Call this to WIPE all data and start fresh.
+    Wipes all memory.
     """
     global PLAYERS, GAMES, STATE
     PLAYERS = {}
@@ -133,27 +155,34 @@ def reset_server():
         "treatment": 1,
         "pairings": {}
     }
-    return jsonify({"success": True, "message": "Server memory wiped successfully."})
+    return jsonify({"success": True, "message": "Server wiped."})
 
 
-# --- Game Logic Routes ---
+# --- Game Control Routes (Researcher) ---
 
 @app.route('/admin/start_treatment', methods=['POST'])
 def start_treatment():
     data = request.json
     treatment = data.get('treatment')
-    ids = [p['uid'] for p in PLAYERS.values() if p['role'] != 'RESEARCHER']
-    random.shuffle(ids)
     
-    pairs = {}
-    for i in range(0, len(ids), 2):
-        if i + 1 < len(ids):
-            pairs[f"pair_{i//2}"] = {"p1": ids[i], "p2": ids[i+1]}
+    # Get all participants (exclude researchers)
+    participant_ids = [p['uid'] for p in PLAYERS.values() if p['role'] != 'RESEARCHER']
+    random.shuffle(participant_ids)
+    
+    # Create pairs
+    new_pairings = {}
+    for i in range(0, len(participant_ids), 2):
+        if i + 1 < len(participant_ids):
+            new_pairings[f"pair_{i//2}"] = {
+                "p1": participant_ids[i],
+                "p2": participant_ids[i+1]
+            }
             
     STATE["status"] = f"TREATMENT_{treatment}"
     STATE["treatment"] = treatment
     STATE["sub_round"] = 1
-    STATE["pairings"] = pairs
+    STATE["pairings"] = new_pairings
+    
     return jsonify({"success": True})
 
 @app.route('/admin/next_round', methods=['POST'])
@@ -164,37 +193,46 @@ def next_round():
         STATE["status"] = "WAITING_NEXT_PHASE"
     return jsonify({"success": True})
 
+# --- Gameplay Routes (Participants) ---
+
 @app.route('/game/offer', methods=['POST'])
 def make_offer():
     data = request.json
-    gid = data.get('game_id')
-    if gid in GAMES:
-        GAMES[gid]['offer'] = data.get('amount')
-        GAMES[gid]['status'] = 'OFFER_MADE'
+    game_id = data.get('game_id')
+    amount = data.get('amount')
+    
+    if game_id in GAMES:
+        GAMES[game_id]['offer'] = amount
+        GAMES[game_id]['status'] = 'OFFER_MADE'
         return jsonify({"success": True})
-    return jsonify({"error": "No game"}), 404
+    return jsonify({"error": "Game not found"}), 404
 
 @app.route('/game/respond', methods=['POST'])
 def respond_offer():
     data = request.json
-    gid = data.get('game_id')
+    game_id = data.get('game_id')
     accepted = data.get('accepted')
     
-    if gid in GAMES:
-        g = GAMES[gid]
-        offer = g['offer']
-        p_earn = (ENDOWMENT - offer) if accepted else 0
-        r_earn = offer if accepted else 0
+    if game_id in GAMES:
+        game = GAMES[game_id]
+        offer = game['offer']
         
-        g['response'] = 'ACCEPTED' if accepted else 'REJECTED'
-        g['status'] = 'COMPLETED'
-        g['earnings'] = {g['proposer']: p_earn, g['responder']: r_earn}
+        prop_earn = (ENDOWMENT - offer) if accepted else 0
+        resp_earn = offer if accepted else 0
         
-        if g['proposer'] in PLAYERS: PLAYERS[g['proposer']]['earnings'] += p_earn
-        if g['responder'] in PLAYERS: PLAYERS[g['responder']]['earnings'] += r_earn
+        game['response'] = 'ACCEPTED' if accepted else 'REJECTED'
+        game['status'] = 'COMPLETED'
+        game['earnings'] = {
+            game['proposer']: prop_earn,
+            game['responder']: resp_earn
+        }
+        
+        # Update cumulative earnings
+        if game['proposer'] in PLAYERS: PLAYERS[game['proposer']]['earnings'] += prop_earn
+        if game['responder'] in PLAYERS: PLAYERS[game['responder']]['earnings'] += resp_earn
         
         return jsonify({"success": True})
-    return jsonify({"error": "No game"}), 404
+    return jsonify({"error": "Game not found"}), 404
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
